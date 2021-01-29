@@ -86,6 +86,27 @@ class Generator(nn.Module):
         x = self.out(x)         # 3 x 256 x 256
         return x
 
+class Decoder(nn.Module):
+    def __init__(self, in_feature=32):
+        super().__init__()
+        self.in_feature = in_feature
+        g = []
+        for _ in range(3):
+            g += [make_block(in_feature)]
+        g += [make_block(3)]
+        self.decoder = nn.Sequential(*g)
+
+    def make_block(self, out_feature):
+        block = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(self.in_feature, out_feature),
+            nn.BatchNorm2d(out_feature),
+            nn.GLU()
+        )
+
+    def forward(self, x):
+        return self.decoder(x)
+
 class Discriminator(nn.Module):
     def __init__(self, hidden_dim=64, in_res=256):
         super().__init__()
@@ -109,6 +130,40 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.1),
             nn.Conv2d(hidden_dim//4, 1, 4, 1, 0)
         )
+        self.decoder1 = Decoder()
+        self.decoder2 = Decoder()
+
+    def make_recon(self, recon=True):
+        self.recon = recon
+
+    def forward(self, x):
+        y = self.block1(x)
+        y1 = self.block2(y)
+        y2 = self.skip2(y)
+        y = y1 + y2
+        y1 = self.block3(y)
+        y2 = self.skip3(y)
+        h1 = y1 + y2        # 32 x 16 x 16 : For cropping
+        # Simply center crop for now, where the literature implemented random crop
+        if len(h1.shape)==4:
+            h1 = h1[:,:,4:12, 4:12]
+        elif len(h1.shape)==3:
+            h1 = h1[:, 4:12, 4:12]
+        else:
+            raise ValueError, "invalid shape for feature map to be cropped, {}".format(h1.shape)
+        y1 = self.block4(h1)
+        y2 = self.skip4(h1)
+        h2 = y1 + y2        # 32 x 8 x 8
+        y = self.out(h2)    # 1 x 5 x 5
+        if self.recon is True:
+            y_part = self.decoder1(h1)
+            y_recon = self.decoder2(h2)
+            # y: 5 x 5 true/false
+            # y_part: reconstructed image from center y_part
+            # y_recon: reconstructed image from whole feature map
+            return y, y_part, y_recon
+        else:
+            return y
 
     def make_block(self, in_channel, out_channel):
         block = nn.Sequential(
