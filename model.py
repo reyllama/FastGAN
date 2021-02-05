@@ -184,13 +184,3 @@ class Discriminator(nn.Module):
             nn.LeakyReLU(0.1)
         )
         return block
-
-
-class encoder(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.block = nn.Conv2d()
-
-    def forward(self, x):
-        return self.block(x)
