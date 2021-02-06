@@ -34,28 +34,36 @@ class SLE(nn.Module):
         x = self.block(low)
         return high * x
 
-def make_noise(z_dim=256):
-    noise = torch.randn(256)
-    return noise[:,None,None]
+def make_noise(n_samples=batch_size, z_dim=256, device="cuda"):
+    noise = torch.randn(n_samples, 256, device=device)
+    return noise[:,:,None,None]
 
 class Generator(nn.Module):
-    def __init__(self, z_dim=256, out_res=256):
+    def __init__(self, in_dim=1024, z_dim=256, out_res=256):
         super().__init__()
         assert out_res == 256, "Only Output Resolution of 256x256 Implemented, got {}".format(out_res)
+
+        self.mapping = nn.Sequential(
+            mapping_block(in_dim, in_dim),
+            mapping_block(in_dim, in_dim//2),
+            mapping_block(in_dim//2, in_dim//2),
+            mapping_block(in_dim//2, z_dim)
+        )
+
         self.block1 = nn.Sequential(
             nn.ConvTranspose2d(z_dim, z_dim, 4, 1, 0),
             nn.BatchNorm2d(z_dim),
-            nn.GLU(),
+            nn.ReLU(),
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(z_dim, 2*z_dim, 3, 1, 1),
             nn.BatchNorm2d(2*z_dim),
-            nn.GLU()
+            nn.ReLU()
         )
-        self.block2 = make_block(2*z_dim, z_dim)
-        self.block3 = make_block(z_dim, z_dim//2)
-        self.block4 = make_block(z_dim//2, z_dim//4)
-        self.block5 = make_block(z_dim//4, z_dim//4)
-        self.block6 = make_block(z_dim//4, z_dim//8)
+        self.block2 = self.make_block(2*z_dim, z_dim)
+        self.block3 = self.make_block(z_dim, z_dim//2)
+        self.block4 = self.make_block(z_dim//2, z_dim//4)
+        self.block5 = self.make_block(z_dim//4, z_dim//4)
+        self.block6 = self.make_block(z_dim//4, z_dim//8)
         self.out = nn.Sequential(
             nn.Conv2d(z_dim//8, 3, 3, 1, 1),
             nn.Tanh()
@@ -70,7 +78,15 @@ class Generator(nn.Module):
             nn.Upsample(scale_factor=2, mode='nearest'),
             nn.Conv2d(in_channel, out_channel, 3, 1, 1),
             nn.BatchNorm2d(out_channel),
-            nn.GLU()
+            nn.ReLU()
+        )
+        return block
+
+    def mapping_block(self, in_dim, out_dim):
+        block = nn.Sequential(
+            nn.Linear(in_dim, out_dim),
+            nn.BatchNorm2d(out_dim),
+            nn.ReLU()
         )
         return block
 
@@ -92,17 +108,18 @@ class Decoder(nn.Module):
         self.in_feature = in_feature
         g = []
         for _ in range(3):
-            g += [make_block(in_feature)]
-        g += [make_block(3)]
+            g += [self.make_block(in_feature)]
+        g += [self.make_block(3)]
         self.decoder = nn.Sequential(*g)
 
     def make_block(self, out_feature):
         block = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv2d(self.in_feature, out_feature),
+            nn.Conv2d(self.in_feature, out_feature, 3, 1, 1),
             nn.BatchNorm2d(out_feature),
-            nn.GLU()
+            nn.ReLU()
         )
+        return block
 
     def forward(self, x):
         return self.decoder(x)
@@ -118,12 +135,12 @@ class Discriminator(nn.Module):
             nn.BatchNorm2d(hidden_dim),
             nn.LeakyReLU(0.1)
         )
-        self.block2 = make_block(hidden_dim, hidden_dim)
-        self.skip2 = down_sample(hidden_dim, hidden_dim)
-        self.block3 = make_block(hidden_dim, hidden_dim//2)
-        self.skip3 = down_sample(hidden_dim, hidden_dim//2)
-        self.block4 = make_block(hidden_dim//2, hidden_dim//2)
-        self.skip4 = down_sample(hidden_dim//2, hidden_dim//2)
+        self.block2 = self.make_block(hidden_dim, hidden_dim)
+        self.skip2 = self.down_sample(hidden_dim, hidden_dim)
+        self.block3 = self.make_block(hidden_dim, hidden_dim//2)
+        self.skip3 = self.down_sample(hidden_dim, hidden_dim//2)
+        self.block4 = self.make_block(hidden_dim//2, hidden_dim//2)
+        self.skip4 = self.down_sample(hidden_dim//2, hidden_dim//2)
         self.out = nn.Sequential(
             nn.Conv2d(hidden_dim//2, hidden_dim//4, 1, 1, 0),
             nn.BatchNorm2d(hidden_dim//4),
@@ -144,15 +161,15 @@ class Discriminator(nn.Module):
         y1 = self.block3(y)
         y2 = self.skip3(y)
         h1 = y1 + y2        # 32 x 16 x 16 : For cropping
+        y1 = self.block4(h1)
+        y2 = self.skip4(h1)
         # Simply center crop for now, where the literature implemented random crop
         if len(h1.shape)==4:
             h1 = h1[:,:,4:12, 4:12]
         elif len(h1.shape)==3:
             h1 = h1[:, 4:12, 4:12]
         else:
-            raise ValueError, "invalid shape for feature map to be cropped, {}".format(h1.shape)
-        y1 = self.block4(h1)
-        y2 = self.skip4(h1)
+            print("invalid shape for feature map to be cropped, {}".format(h1.shape))
         h2 = y1 + y2        # 32 x 8 x 8
         y = self.out(h2)    # 1 x 5 x 5
         if self.recon is True:
