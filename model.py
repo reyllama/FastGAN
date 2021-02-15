@@ -1,32 +1,17 @@
-import torch
-from torch import nn, optim
-import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms, datasets
-from torchvision.models import inception_v3
-from torchvision.utils import makegrid
 import numpy as np
-import random
 import os
-import time
-from PIL import Image
-import glob
-from IPython.display import HTML
-from tqdm.auto import tqdm
-import matplotlib.pyplot as plt
-import matplotlib.animation as animation
-
-device = "cuda" if torch.cuda.is_available() else "cpu"
-inception = inception_v3(pretrained=True) # For computation of FID score
+import torch
+from torch import nn
+import torch.nn.functional as F
 
 class SLE(nn.Module):
     def __init__(self, in_channel):
         super().__init__()
         self.block = nn.Sequential(
             nn.AdaptiveAvgPool2d(output_size=4),
-            nn.Conv2d(in_channel, in_channel, 4, 1, 0),
+            nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel, 4, 1, 0)),
             nn.LeakyReLU(0.1),
-            nn.Conv2d(in_channel, in_channel//8, 1, 1, 0),
+            nn.utils.spectral_norm(nn.Conv2d(in_channel, in_channel//8, 1, 1, 0)),
             nn.Sigmoid()
         )
 
@@ -34,21 +19,10 @@ class SLE(nn.Module):
         x = self.block(low)
         return high * x
 
-def make_noise(n_samples=batch_size, z_dim=256, device="cuda"):
-    noise = torch.randn(n_samples, 256, device=device)
-    return noise[:,:,None,None]
-
 class Generator(nn.Module):
-    def __init__(self, in_dim=1024, z_dim=256, out_res=256):
+    def __init__(self, z_dim=1024, out_res=256):
         super().__init__()
         assert out_res == 256, "Only Output Resolution of 256x256 Implemented, got {}".format(out_res)
-
-        self.mapping = nn.Sequential(
-            mapping_block(in_dim, in_dim),
-            mapping_block(in_dim, in_dim//2),
-            mapping_block(in_dim//2, in_dim//2),
-            mapping_block(in_dim//2, z_dim)
-        )
 
         self.block1 = nn.Sequential(
             nn.ConvTranspose2d(z_dim, z_dim, 4, 1, 0),
@@ -59,6 +33,7 @@ class Generator(nn.Module):
             nn.BatchNorm2d(2*z_dim),
             nn.ReLU()
         )
+
         self.block2 = self.make_block(2*z_dim, z_dim)
         self.block3 = self.make_block(z_dim, z_dim//2)
         self.block4 = self.make_block(z_dim//2, z_dim//4)
@@ -69,23 +44,15 @@ class Generator(nn.Module):
             nn.Tanh()
         )
 
-        self.SLE1 = SLE(512)
-        self.SLE2 = SLE(256)
+        self.SLE1 = SLE(2*z_dim)
+        self.SLE2 = SLE(z_dim)
 
 
     def make_block(self, in_channel, out_channel):
         block = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv2d(in_channel, out_channel, 3, 1, 1),
+            nn.utils.spectral_norm(nn.Conv2d(in_channel, out_channel, 3, 1, 1)),
             nn.BatchNorm2d(out_channel),
-            nn.ReLU()
-        )
-        return block
-
-    def mapping_block(self, in_dim, out_dim):
-        block = nn.Sequential(
-            nn.Linear(in_dim, out_dim),
-            nn.BatchNorm2d(out_dim),
             nn.ReLU()
         )
         return block
@@ -115,7 +82,7 @@ class Decoder(nn.Module):
     def make_block(self, out_feature):
         block = nn.Sequential(
             nn.Upsample(scale_factor=2, mode='nearest'),
-            nn.Conv2d(self.in_feature, out_feature, 3, 1, 1),
+            nn.utils.spectral_norm(nn.Conv2d(self.in_feature, out_feature, 3, 1, 1)),
             nn.BatchNorm2d(out_feature),
             nn.ReLU()
         )
@@ -124,14 +91,15 @@ class Decoder(nn.Module):
     def forward(self, x):
         return self.decoder(x)
 
+
 class Discriminator(nn.Module):
     def __init__(self, hidden_dim=64, in_res=256):
         super().__init__()
         assert in_res == 256, "Only Output Resolution of 256x256 Implemented, got {}".format(in_res)
         self.block1 = nn.Sequential(
-            nn.Conv2d(3, hidden_dim//2, 4, 2, 1),
+            nn.utils.spectral_norm(nn.Conv2d(3, hidden_dim//2, 4, 2, 1)),
             nn.LeakyReLU(0.1),
-            nn.Conv2d(hidden_dim//2, hidden_dim, 4, 2, 1),
+            nn.utils.spectral_norm(nn.Conv2d(hidden_dim//2, hidden_dim, 4, 2, 1)),
             nn.BatchNorm2d(hidden_dim),
             nn.LeakyReLU(0.1)
         )
@@ -142,10 +110,10 @@ class Discriminator(nn.Module):
         self.block4 = self.make_block(hidden_dim//2, hidden_dim//2)
         self.skip4 = self.down_sample(hidden_dim//2, hidden_dim//2)
         self.out = nn.Sequential(
-            nn.Conv2d(hidden_dim//2, hidden_dim//4, 1, 1, 0),
+            nn.utils.spectral_norm(nn.Conv2d(hidden_dim//2, hidden_dim//4, 1, 1, 0)),
             nn.BatchNorm2d(hidden_dim//4),
             nn.LeakyReLU(0.1),
-            nn.Conv2d(hidden_dim//4, 1, 4, 1, 0)
+            nn.utils.spectral_norm(nn.Conv2d(hidden_dim//4, 1, 4, 1, 0))
         )
         self.decoder1 = Decoder()
         self.decoder2 = Decoder()
@@ -184,10 +152,10 @@ class Discriminator(nn.Module):
 
     def make_block(self, in_channel, out_channel):
         block = nn.Sequential(
-            nn.Conv2d(in_channel, out_channel, 4, 2, 1),
+            nn.utils.spectral_norm(nn.Conv2d(in_channel, out_channel, 4, 2, 1)),
             nn.BatchNorm2d(out_channel),
             nn.LeakyReLU(0.1),
-            nn.Conv2d(out_channel, out_channel, 3, 1, 1),
+            nn.utils.spectral_norm(nn.Conv2d(out_channel, out_channel, 3, 1, 1)),
             nn.BatchNorm2d(out_channel),
             nn.LeakyReLU(0.1)
         )
@@ -196,7 +164,7 @@ class Discriminator(nn.Module):
     def down_sample(self, in_channel, out_channel):
         block = nn.Sequential(
             nn.AvgPool2d(2, 2),
-            nn.Conv2d(in_channel, out_channel, 1, 1, 0),
+            nn.utils.spectral_norm(nn.Conv2d(in_channel, out_channel, 1, 1, 0)),
             nn.BatchNorm2d(out_channel),
             nn.LeakyReLU(0.1)
         )
